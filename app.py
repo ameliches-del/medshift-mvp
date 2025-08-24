@@ -122,10 +122,8 @@ def build_schedule():
         return max(deficits, key=lambda g: deficits[g])  # largest deficit
 
     PREF_WED_FRI = {2, 4}  # Wed/Fri
-    sum_targets = sum(group_targets.values()) if group_targets else 0
 
     def all_targets_met():
-        # האם כל הקבוצות הגיעו ליעד?
         if not group_targets:
             return True
         for g, t in group_targets.items():
@@ -133,53 +131,61 @@ def build_schedule():
                 return False
         return True
 
-    # ---------- PRE-PASS: ensure everyone gets a weekend/holiday if possible ----------
+    # ----- PRE-PASS: fair distribution of weekend/holiday (one per intern first) -----
     hol_set = set(pd.to_datetime(holidays_df["date"]).dt.date) if not holidays_df.empty else set()
     special_days = [d for d in calendar_days if (d.weekday() in WEEKEND_DAYS) or (d in hol_set)]
 
-    def group_target_of(email):
+    def intern_group(email):
         try:
             row = interns.loc[interns.email == email].iloc[0]
-            return group_targets.get(row.get("group"), 0)
+            return row.get("group") if pd.notna(row.get("group")) else None
         except Exception:
-            return 0
+            return None
 
-    intern_emails = [row.email for _, row in interns.iterrows()]
-    # מי שקבוצתו עם יעד גדול יותר יקבל ניסיון ראשון
-    intern_emails.sort(key=lambda e: (-group_target_of(e), interns.loc[interns.email == e, "assigned"].iloc[0]))
+    def has_special(email):
+        return any(a["email"] == email and ((a["date"].weekday() in WEEKEND_DAYS) or (a["date"] in hol_set)) for a in assignments)
 
-    for email in intern_emails:
-        already_has_special = any(a["email"] == email and (a["date"].weekday() in WEEKEND_DAYS or a["date"] in hol_set) for a in assignments)
-        if already_has_special:
+    for day in special_days:
+        # already filled? (one slot per day)
+        if any(a["date"] == day and a["email"] is not None for a in assignments):
             continue
-        for day in special_days:
-            if any(a["date"] == day and a["email"] is not None for a in assignments):
+        year, week_idx, _ = day.isocalendar()
+
+        cand = []
+        for _, r in interns.iterrows():
+            email = r.email
+            if has_special(email):
+                continue
+            if r.assigned >= r.max_shifts:
+                continue
+            if (email, day) in unavail:
                 continue
             last = last_day_map[email]
             if last is not None and (day - last).days < min_days_between_shifts:
                 continue
-            if (email, day) in unavail:
-                continue
-            year, week_idx, _ = day.isocalendar()
             if lock_weekends and day.weekday() in WEEKEND_DAYS and weekend_last[(year, week_idx)] == email:
                 continue
 
-            # assign
-            assignments.append({"date": day, "slot": 1, "email": email})
-            last_day_map[email] = day
-            interns.loc[interns.email == email, "assigned"] += 1
+            gname = intern_group(email)
+            target = group_targets.get(gname, 0)
+            rest_days = 999 if last is None else (day - last).days
+            cand.append((-target, r.assigned, -rest_days, str(r.get("last_name", r.get("first_name",""))), email))
 
-            row = interns.loc[interns.email == email].iloc[0]
-            gname = row.get("group") if pd.notna(row.get("group")) else None
+        if cand:
+            cand.sort()
+            chosen_email = cand[0][4]
+            assignments.append({"date": day, "slot": 1, "email": chosen_email})
+            last_day_map[chosen_email] = day
+            interns.loc[interns.email == chosen_email, "assigned"] += 1
+            gname = intern_group(chosen_email)
             if gname:
                 group_assigned[gname] += 1
             if day.weekday() in WEEKEND_DAYS:
-                weekend_last[(year, week_idx)] = email
-            break  # one special day per intern
+                weekend_last[(year, week_idx)] = chosen_email
 
-    # ---------- MAIN LOOP: one slot per day ----------
+    # ----- MAIN LOOP: pick best from ALL groups per day -----
     for day in calendar_days:
-        # skip if pre-pass already assigned this day
+        # skip if pre-pass already filled this day
         if any(a["date"] == day and a["email"] is not None for a in assignments):
             continue
 
@@ -200,28 +206,28 @@ def build_schedule():
             if lock_weekends and day.weekday() in WEEKEND_DAYS and weekend_last[(year, week_idx)] == email:
                 continue
 
-            # scoring
+            # group / deficit
+            gname = r.get("group") if pd.notna(r.get("group")) else None
+            deficit = max(0, group_targets.get(gname, 0) - group_assigned[gname]) if gname else 0
+
+            # --- HARD TARGETS: if some groups still below target, ignore candidates from groups at/over target
+            if not all_targets_met() and deficit == 0:
+                continue
+
+            # tie-breakers
+            last = last_day_map[email]
             rest_days = 999 if last is None else (day - last).days
             name_for_sort = r.get("last_name", r.get("first_name", ""))
 
-            gname = r.get("group") if pd.notna(r.get("group")) else None
-            # deficit = כמה חסר לקבוצה כדי להגיע ליעד (רק חיובי)
-            deficit = max(0, group_targets.get(gname, 0) - group_assigned[gname]) if gname else 0
-
-            # Wed/Fri bonus רק אם עדיין לא הגענו ליעד של הקבוצה המובילה
-            wed_fri_bonus = 0.0
-            if lead and gname == lead and deficit > 0 and day.weekday() in PREF_WED_FRI:
-                wed_fri_bonus = 0.5
-
             if not all_targets_met():
-                # שלב יעדים קשיחים: משבצים רק לפי deficit (וחיזוק ד/ו למובילה)
+                # still filling targets: prefer the leading group's Wed/Fri slightly
+                wed_fri_bonus = 0.5 if (lead and gname == lead and day.weekday() in PREF_WED_FRI and deficit > 0) else 0.0
                 score_primary = deficit + wed_fri_bonus
             else:
-                # כל היעדים מולאו → עודפים: לפי דרוג יעד (גבוה קודם)
-                rank_bonus = 100.0 - group_rank.get(gname, 99)  # 100, 99, 98...
-                score_primary = rank_bonus  # wed_fri כבר לא רלוונטי בשלב עודפים
+                # overflow stage: fixed rank by target size (higher first)
+                score_primary = 100.0 - group_rank.get(gname, 99)
 
-            # טופל מיון: ציון גבוה יותר עדיף → נשמור שלילי כדי למיין בעלייה
+            # store negative for ascending sort (higher score first)
             candidates.append((-score_primary, r.assigned, -rest_days, str(name_for_sort), email))
 
         if candidates:
@@ -241,7 +247,6 @@ def build_schedule():
             if day.weekday() in WEEKEND_DAYS:
                 weekend_last[(year, week_idx)] = chosen_email
         else:
-            # no valid candidate -> leave empty
             assignments.append({"date": day, "slot": 1, "email": None})
 
     out = pd.DataFrame(assignments)
