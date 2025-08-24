@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
-from collections import defaultdict, deque
+from collections import defaultdict
 import io
 
 st.set_page_config(page_title="MedShift — MVP", page_icon="🩺", layout="wide")
@@ -74,18 +74,18 @@ with st.sidebar.expander("📜 Rules", expanded=True):
     st.caption("One 26h duty per day. Rest: Duty on D ⇒ no duties on D+1,D+2 (earliest D+3).")
     max_shifts_per_day = 1
     min_days_between_shifts = 3
-    respect_groups = st.checkbox("Balance by seniority groups", value=True)
     lock_weekends = st.checkbox("Prefer not to repeat same intern on weekend", value=True)
 
 # -----------------------------
-# Helper structures
+# Helpers & precomputed sets
 # -----------------------------
+WEEKEND_DAYS = {4, 5}  # Fri(4), Sat(5)  (Mon=0..Sun=6)
+
 def daterange(start, end):
     for n in range(int((end - start).days) + 1):
         yield start + timedelta(n)
 
 calendar_days = [d for d in daterange(start_date, end_date)]
-total_slots = len(calendar_days) * max_shifts_per_day
 
 if "max_shifts" not in interns_df.columns:
     interns_df["max_shifts"] = 9999
@@ -106,42 +106,28 @@ def build_schedule():
     interns["assigned"] = 0
     interns["last_day"] = pd.NaT
 
-    if respect_groups and "group" in interns.columns:
-        groups = {g: interns[interns.group == g].reset_index(drop=True) for g in interns.group.fillna("_").unique()}
-        group_cycle = deque(sorted(groups.keys()))
-    else:
-        groups = {"all": interns}
-        group_cycle = deque(["all"])
-
-    group_order = []
-    if group_targets:
-        group_order = sorted(group_targets.keys(), key=lambda g: group_targets[g], reverse=True)
-    group_rank = {g: i for i, g in enumerate(group_order)}  
+    # ranking for overflow (extras after hitting targets): higher target ⇒ higher rank
+    group_order = sorted(group_targets.keys(), key=lambda g: group_targets[g], reverse=True) if group_targets else []
+    group_rank = {g: i for i, g in enumerate(group_order)}  # 0 = highest
 
     assignments = []
     last_day_map = {row.email: None for _, row in interns.iterrows()}
-    weekend_last = defaultdict(lambda: None)
+    weekend_last = defaultdict(lambda: None)  # (year, week) -> email
     group_assigned = defaultdict(int)
-
-    def next_pool():
-        g = group_cycle[0]
-        group_cycle.rotate(-1)
-        return g, groups[g]
 
     def leading_group():
         if not group_targets:
             return None
         deficits = {g: group_targets[g] - group_assigned[g] for g in group_targets}
-        return max(deficits, key=lambda g: deficits[g])
+        return max(deficits, key=lambda g: deficits[g])  # largest deficit
 
-    PREF_WED_FRI = {2, 4}  
+    PREF_WED_FRI = {2, 4}  # Wed/Fri
     sum_targets = sum(group_targets.values()) if group_targets else 0
 
     def all_targets_met():
-        return group_targets and sum(group_assigned[g] for g in group_targets) >= sum_targets
+        return group_targets and sum(group_assigned.values()) >= sum_targets
 
-    # ----- PRE-PASS: ensure everyone has weekend/holiday -----
-    WEEKEND_DAYS = {4, 5}
+    # ---------- PRE-PASS: ensure everyone gets a weekend/holiday if possible ----------
     hol_set = set(pd.to_datetime(holidays_df["date"]).dt.date) if not holidays_df.empty else set()
     special_days = [d for d in calendar_days if (d.weekday() in WEEKEND_DAYS) or (d in hol_set)]
 
@@ -160,81 +146,96 @@ def build_schedule():
         if already_has_special:
             continue
         for day in special_days:
+            # if day already taken (we have 1 slot per day), skip
             if any(a["date"] == day and a["email"] is not None for a in assignments):
                 continue
+            # rest + availability
             last = last_day_map[email]
             if last is not None and (day - last).days < min_days_between_shifts:
                 continue
             if (email, day) in unavail:
                 continue
+            # weekend repetition within same ISO week
+            year, week_idx, _ = day.isocalendar()
+            if lock_weekends and day.weekday() in WEEKEND_DAYS and weekend_last[(year, week_idx)] == email:
+                continue
+
+            # assign
             assignments.append({"date": day, "slot": 1, "email": email})
             last_day_map[email] = day
             interns.loc[interns.email == email, "assigned"] += 1
-            g_row = interns.loc[interns.email == email].iloc[0]
-            gname = g_row["group"] if "group" in g_row.index and pd.notna(g_row["group"]) else None
+
+            # update counters
+            row = interns.loc[interns.email == email].iloc[0]
+            gname = row.get("group") if pd.notna(row.get("group")) else None
             if gname:
                 group_assigned[gname] += 1
-            break  
+            if day.weekday() in WEEKEND_DAYS:
+                weekend_last[(year, week_idx)] = email
+            break  # one special day per intern
 
-    # ----- MAIN LOOP -----
+    # ---------- MAIN LOOP: one slot per day ----------
     for day in calendar_days:
+        # skip if pre-pass already assigned this day
         if any(a["date"] == day and a["email"] is not None for a in assignments):
-            continue  
+            continue
+
         year, week_idx, _ = day.isocalendar()
         lead = leading_group()
-        for slot in range(max_shifts_per_day):
-            tried_groups = 0
-            chosen = None
-            while tried_groups < len(group_cycle) and chosen is None:
-                g_name, pool = next_pool()
-                candidates = []
-                for _, r in pool.iterrows():
-                    email = r.email
-                    if r.assigned >= r.max_shifts:
-                        continue
-                    if (email, day) in unavail:
-                        continue
-                    last = last_day_map[email]
-                    if last is not None and (day - last).days < min_days_between_shifts:
-                        continue
-                    if lock_weekends and day.weekday() >= 5:
-                        prev_week_pick = weekend_last[(year, week_idx)]
-                        if prev_week_pick == email:
-                            continue
-                    rest_days = 999 if last is None else (day - last).days
-                    name_for_sort = r.get("last_name", r.get("first_name", ""))
-                    gname = r["group"] if "group" in r and pd.notna(r["group"]) else None
 
-                    deficit = 0
-                    if gname and gname in group_targets:
-                        deficit = max(0, group_targets[gname] - group_assigned[gname])
-                    overflow_bonus = 0.0
-                    if all_targets_met() and gname in group_rank:
-                        overflow_bonus = 100.0 - group_rank[gname]
-                    wed_fri_bonus = 0.0
-                    if lead and gname == lead and (group_targets[gname] - group_assigned[gname]) > 0 and day.weekday() in PREF_WED_FRI:
-                        wed_fri_bonus = 0.5
-                    score_primary = deficit + overflow_bonus + wed_fri_bonus
-                    candidates.append((-score_primary, r.assigned, -rest_days, str(name_for_sort), email))
+        candidates = []
+        for _, r in interns.iterrows():
+            email = r.email
+            # capacity / availability / rest
+            if r.assigned >= r.max_shifts:
+                continue
+            if (email, day) in unavail:
+                continue
+            last = last_day_map[email]
+            if last is not None and (day - last).days < min_days_between_shifts:
+                continue
+            if lock_weekends and day.weekday() in WEEKEND_DAYS and weekend_last[(year, week_idx)] == email:
+                continue
 
-                if candidates:
-                    candidates.sort()
-                    chosen_email = candidates[0][4]
-                    chosen = chosen_email
-                    chosen_row = interns.loc[interns.email == chosen_email].iloc[0]
-                    chosen_group = chosen_row["group"] if "group" in chosen_row.index and pd.notna(chosen_row["group"]) else None
-                    if chosen_group:
-                        group_assigned[chosen_group] += 1
-                    interns.loc[interns.email == chosen_email, "assigned"] += 1
-                    interns.loc[interns.email == chosen_email, "last_day"] = pd.to_datetime(day)
-                    last_day_map[chosen_email] = day
-                    if day.weekday() >= 5:
-                        weekend_last[(year, week_idx)] = chosen_email
-                    assignments.append({"date": day, "slot": slot + 1, "email": chosen_email})
-                else:
-                    tried_groups += 1
-            if chosen is None:
-                assignments.append({"date": day, "slot": slot + 1, "email": None})
+            # scoring
+            rest_days = 999 if last is None else (day - last).days
+            name_for_sort = r.get("last_name", r.get("first_name", ""))
+
+            gname = r.get("group") if pd.notna(r.get("group")) else None
+            deficit = max(0, group_targets.get(gname, 0) - group_assigned[gname]) if gname else 0
+
+            # extras after targets: give to higher-ranked groups first
+            overflow_bonus = 0.0
+            if all_targets_met() and gname in group_rank:
+                overflow_bonus = 100.0 - group_rank[gname]  # 100,99,98,...
+
+            # Wed/Fri bonus for the current leading (still under target)
+            wed_fri_bonus = 0.0
+            if lead and gname == lead and deficit > 0 and day.weekday() in PREF_WED_FRI:
+                wed_fri_bonus = 0.5
+
+            score_primary = deficit + overflow_bonus + wed_fri_bonus
+            candidates.append((-score_primary, r.assigned, -rest_days, str(name_for_sort), email))
+
+        if candidates:
+            candidates.sort()
+            chosen_email = candidates[0][4]
+
+            # assign
+            assignments.append({"date": day, "slot": 1, "email": chosen_email})
+            last_day_map[chosen_email] = day
+            interns.loc[interns.email == chosen_email, "assigned"] += 1
+
+            # counters
+            row = interns.loc[interns.email == chosen_email].iloc[0]
+            gname = row.get("group") if pd.notna(row.get("group")) else None
+            if gname:
+                group_assigned[gname] += 1
+            if day.weekday() in WEEKEND_DAYS:
+                weekend_last[(year, week_idx)] = chosen_email
+        else:
+            # no valid candidate -> leave empty
+            assignments.append({"date": day, "slot": 1, "email": None})
 
     out = pd.DataFrame(assignments)
     join_cols = [c for c in ["email", "first_name", "last_name", "group"] if c in interns_df.columns]
@@ -249,10 +250,12 @@ def validate_schedule(df, min_rest_days=3, max_per_day=1):
     issues = []
     if df.empty:
         return issues
+    # one per day
     day_counts = df.groupby("date").size()
     for day, cnt in day_counts.items():
         if cnt > max_per_day:
             issues.append(f"More than {max_per_day} assignment on {day}.")
+    # rest rule
     df2 = df.dropna(subset=["email"]).copy()
     df2["date"] = pd.to_datetime(df2["date"]).dt.date
     by_email = df2.groupby("email")["date"].apply(lambda s: sorted(set(s)))
@@ -264,7 +267,6 @@ def validate_schedule(df, min_rest_days=3, max_per_day=1):
                     issues.append(f"Rest rule violated for {email}: {d} -> {dates[j]} (gap {gap}d)")
     return issues
 
-WEEKEND_DAYS = {4,5}
 def weekend_issues(df):
     issues = []
     if df.empty:
@@ -274,10 +276,10 @@ def weekend_issues(df):
     df2["weekday"] = pd.to_datetime(df2["date"]).dt.weekday
     df2["iso_year_week"] = pd.to_datetime(df2["date"]).dt.isocalendar().year.astype(str) + "-" + \
                            pd.to_datetime(df2["date"]).dt.isocalendar().week.astype(str)
-    for (email, yw), g in df2.groupby(["email","iso_year_week"]):
-        wk = g[g["weekday"].isin(WEEKEND_DAYS)]
-        if len(wk) >= 2:
-            days_str = ", ".join(sorted(str(d) for d in wk["date"].unique()))
+    wkend = df2[df2["weekday"].isin(WEEKEND_DAYS)]
+    for (email, yw), g in wkend.groupby(["email","iso_year_week"]):
+        if len(g) >= 2:
+            days_str = ", ".join(sorted(str(d) for d in g["date"].unique()))
             issues.append(f"Weekend repeat for {email} in week {yw}: {days_str}")
     return issues
 
@@ -300,11 +302,9 @@ def must_have_weekend_or_holiday(df, holidays_df):
 # -----------------------------
 # Main CTA
 # -----------------------------
-colA, colB = st.columns([1,1])
-with colA:
-    if st.button("🧮 Run Scheduler"):
-        schedule_df = build_schedule()
-        st.session_state["schedule_df"] = schedule_df
+if st.button("🧮 Run Scheduler"):
+    schedule_df = build_schedule()
+    st.session_state["schedule_df"] = schedule_df
 
 schedule_df = st.session_state.get("schedule_df", pd.DataFrame())
 
@@ -317,8 +317,9 @@ if not schedule_df.empty:
         for p in problems:
             st.write("• " + p)
     else:
-        st.success("Validation passed!")
+        st.success("Validation passed: one duty/day, 3-day rest, weekend respected, and everyone has weekend/holiday.")
 
+    # 🎯 Group quota check (target vs actual)
     if group_targets:
         st.subheader("🎯 Group quota check")
         actual_by_group = (
@@ -333,6 +334,7 @@ if not schedule_df.empty:
         compare["delta"] = compare["actual"] - compare["target"]
         st.dataframe(compare, use_container_width=True)
 
+    # 📅 Calendar
     st.subheader("📅 Calendar view")
     pivot = schedule_df.copy()
     pivot["assignee"] = pivot.apply(
@@ -344,9 +346,11 @@ if not schedule_df.empty:
     calendar.columns = [f"Slot {i}" for i in calendar.columns]
     st.dataframe(calendar, use_container_width=True)
 
+    # 📋 Flat table
     st.subheader("📋 Flat table")
     st.dataframe(schedule_df, use_container_width=True)
 
+    # 📈 Load per intern
     st.subheader("📈 Load per intern")
     counts = (
         schedule_df.dropna(subset=["email"])
@@ -356,6 +360,7 @@ if not schedule_df.empty:
     )
     st.dataframe(counts.sort_values("shifts", ascending=False), use_container_width=True)
 
+    # ⬇️ Export
     csv_buf = io.StringIO()
     schedule_df.to_csv(csv_buf, index=False)
     st.download_button("⬇️ Download CSV", data=csv_buf.getvalue(),
