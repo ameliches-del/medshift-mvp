@@ -23,10 +23,10 @@ with st.sidebar.expander("📅 Schedule Window", expanded=True):
 with st.sidebar.expander("🧑‍⚕️ Interns & quotas", expanded=True):
     st.markdown("Upload a CSV. Columns: **first_name,last_name,email,group,max_shifts**")
     default_interns_csv = """first_name,last_name,email,group,max_shifts
-Dana,Levi,dana@example.com,A,6
-Noa,Cohen,noa@example.com,A,6
-Yossi,Bar,yossi@example.com,B,6
-Amit,Meliches,amit@example.com,B,6
+Dana,Levi,dana@example.com,חדשים,10
+Noa,Cohen,noa@example.com,לפני שלב א,10
+Yossi,Bar,yossi@example.com,אחרי שלב א,10
+Amit,Meliches,amit@example.com,חדשים,10
 """
     interns_file = st.file_uploader("Interns CSV", type=["csv"], key="interns")
     if interns_file:
@@ -46,7 +46,7 @@ with st.sidebar.expander("🚫 Unavailability (optional)", expanded=False):
         st.dataframe(unavail_df, use_container_width=True)
 
 with st.sidebar.expander("🏷️ Group quotas (optional)", expanded=False):
-    st.markdown("Upload CSV with columns: **group,target_shifts**")
+    st.markdown("Upload CSV with columns: **group,target_shifts**  (targets for THIS window)")
     group_file = st.file_uploader("Group quotas CSV", type=["csv"], key="group_quotas")
     if group_file:
         group_quota_df = pd.read_csv(group_file)
@@ -106,7 +106,7 @@ def build_schedule():
     interns["assigned"] = 0
     interns["last_day"] = pd.NaT
 
-    # ranking for overflow (extras after hitting targets): higher target ⇒ higher rank
+    # rank for overflow: higher target ⇒ higher priority
     group_order = sorted(group_targets.keys(), key=lambda g: group_targets[g], reverse=True) if group_targets else []
     group_rank = {g: i for i, g in enumerate(group_order)}  # 0 = highest
 
@@ -125,7 +125,13 @@ def build_schedule():
     sum_targets = sum(group_targets.values()) if group_targets else 0
 
     def all_targets_met():
-        return group_targets and sum(group_assigned.values()) >= sum_targets
+        # האם כל הקבוצות הגיעו ליעד?
+        if not group_targets:
+            return True
+        for g, t in group_targets.items():
+            if group_assigned[g] < t:
+                return False
+        return True
 
     # ---------- PRE-PASS: ensure everyone gets a weekend/holiday if possible ----------
     hol_set = set(pd.to_datetime(holidays_df["date"]).dt.date) if not holidays_df.empty else set()
@@ -139,6 +145,7 @@ def build_schedule():
             return 0
 
     intern_emails = [row.email for _, row in interns.iterrows()]
+    # מי שקבוצתו עם יעד גדול יותר יקבל ניסיון ראשון
     intern_emails.sort(key=lambda e: (-group_target_of(e), interns.loc[interns.email == e, "assigned"].iloc[0]))
 
     for email in intern_emails:
@@ -146,16 +153,13 @@ def build_schedule():
         if already_has_special:
             continue
         for day in special_days:
-            # if day already taken (we have 1 slot per day), skip
             if any(a["date"] == day and a["email"] is not None for a in assignments):
                 continue
-            # rest + availability
             last = last_day_map[email]
             if last is not None and (day - last).days < min_days_between_shifts:
                 continue
             if (email, day) in unavail:
                 continue
-            # weekend repetition within same ISO week
             year, week_idx, _ = day.isocalendar()
             if lock_weekends and day.weekday() in WEEKEND_DAYS and weekend_last[(year, week_idx)] == email:
                 continue
@@ -165,7 +169,6 @@ def build_schedule():
             last_day_map[email] = day
             interns.loc[interns.email == email, "assigned"] += 1
 
-            # update counters
             row = interns.loc[interns.email == email].iloc[0]
             gname = row.get("group") if pd.notna(row.get("group")) else None
             if gname:
@@ -202,19 +205,23 @@ def build_schedule():
             name_for_sort = r.get("last_name", r.get("first_name", ""))
 
             gname = r.get("group") if pd.notna(r.get("group")) else None
+            # deficit = כמה חסר לקבוצה כדי להגיע ליעד (רק חיובי)
             deficit = max(0, group_targets.get(gname, 0) - group_assigned[gname]) if gname else 0
 
-            # extras after targets: give to higher-ranked groups first
-            overflow_bonus = 0.0
-            if all_targets_met() and gname in group_rank:
-                overflow_bonus = 100.0 - group_rank[gname]  # 100,99,98,...
-
-            # Wed/Fri bonus for the current leading (still under target)
+            # Wed/Fri bonus רק אם עדיין לא הגענו ליעד של הקבוצה המובילה
             wed_fri_bonus = 0.0
             if lead and gname == lead and deficit > 0 and day.weekday() in PREF_WED_FRI:
                 wed_fri_bonus = 0.5
 
-            score_primary = deficit + overflow_bonus + wed_fri_bonus
+            if not all_targets_met():
+                # שלב יעדים קשיחים: משבצים רק לפי deficit (וחיזוק ד/ו למובילה)
+                score_primary = deficit + wed_fri_bonus
+            else:
+                # כל היעדים מולאו → עודפים: לפי דרוג יעד (גבוה קודם)
+                rank_bonus = 100.0 - group_rank.get(gname, 99)  # 100, 99, 98...
+                score_primary = rank_bonus  # wed_fri כבר לא רלוונטי בשלב עודפים
+
+            # טופל מיון: ציון גבוה יותר עדיף → נשמור שלילי כדי למיין בעלייה
             candidates.append((-score_primary, r.assigned, -rest_days, str(name_for_sort), email))
 
         if candidates:
