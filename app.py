@@ -197,6 +197,44 @@ with colA:
 
 # Show results if available
 schedule_df = st.session_state.get("schedule_df", pd.DataFrame())
+schedule_df = st.session_state.get("schedule_df", pd.DataFrame())
+
+# -----------------------------
+# Validation function
+# -----------------------------
+def validate_schedule(df, min_rest_days=3, max_per_day=1):
+    issues = []
+    if df.empty:
+        return issues
+
+    # בדיקת מקסימום שיבוצים ביום
+    day_counts = df.groupby("date").size()
+    for day, cnt in day_counts.items():
+        if cnt > max_per_day:
+            issues.append(f"More than {max_per_day} assignment on {day}.")
+
+    # בדיקת מנוחה: D -> אסור D+1,D+2
+    df2 = df.dropna(subset=["email"]).copy()
+    df2["date"] = pd.to_datetime(df2["date"]).dt.date
+    by_email = df2.groupby("email")["date"].apply(lambda s: sorted(set(s)))
+    for email, dates in by_email.items():
+        for i, d in enumerate(dates):
+            for j in range(i+1, len(dates)):
+                gap = (dates[j] - d).days
+                if gap < min_rest_days:
+                    issues.append(f"Rest rule violated for {email}: {d} -> {dates[j]} (gap {gap}d)")
+    return issues
+
+# Run validation if schedule exists
+
+if not schedule_df.empty:
+    problems = validate_schedule(schedule_df, min_rest_days=3, max_per_day=1)
+    if problems:
+        st.error("Validation issues found:")
+        for p in problems:
+            st.write("• " + p)
+    else:
+        st.info("Validation passed: one duty/day and 3-day rest rule respected.")
 
 if not schedule_df.empty:
     st.success("Schedule created! Scroll for views & export.")
