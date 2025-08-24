@@ -54,8 +54,9 @@ noa@example.com,2025-09-10
         st.dataframe(unavail_df, use_container_width=True)
 
 with st.sidebar.expander("📜 Rules", expanded=True):
-    max_shifts_per_day = st.number_input("Max shifts per day (coverage target)", 1, 10, 2)
-    min_days_between_shifts = st.number_input("Min rest days between shifts", 0, 7, 1)
+    st.caption("One 26h duty per day. Rest rule: Duty on D ⇒ no duties on D+1, D+2 (earliest D+3).")
+    max_shifts_per_day = 1
+    min_days_between_shifts = 3
     respect_groups = st.checkbox(
         "Balance by seniority groups",
         value=True,
