@@ -52,6 +52,29 @@ noa@example.com,2025-09-10
         )
     if not unavail_df.empty:
         st.dataframe(unavail_df, use_container_width=True)
+with st.sidebar.expander("🏷️ Group quotas (optional)", expanded=False):
+    st.markdown("Upload CSV with columns: **group,target_shifts** (absolute targets for the selected window)")
+    default_group_csv = """group,target_shifts
+A,10
+B,6
+"""
+    group_file = st.file_uploader("Group quotas CSV", type=["csv"], key="group_quotas")
+    if group_file:
+        group_quota_df = pd.read_csv(group_file)
+    else:
+        group_quota_df = pd.read_csv(io.StringIO(default_group_csv)) if st.checkbox("Use sample group quotas") else pd.DataFrame(columns=["group","target_shifts"])
+    if not group_quota_df.empty:
+        st.dataframe(group_quota_df, use_container_width=True)
+
+# Map quotas for quick use
+group_targets = {}
+if 'group_quota_df' in locals() and not group_quota_df.empty:
+    for _, r in group_quota_df.iterrows():
+        if pd.notna(r.get("group")) and pd.notna(r.get("target_shifts")):
+            try:
+                group_targets[str(r["group"])] = int(r["target_shifts"])
+            except Exception:
+                pass
 
 with st.sidebar.expander("📜 Rules", expanded=True):
     st.caption("One 26h duty per day. Rest rule: Duty on D ⇒ no duties on D+1, D+2 (earliest D+3).")
@@ -95,6 +118,7 @@ def build_schedule():
     interns = interns_df.copy()
     interns["assigned"] = 0
     interns["last_day"] = pd.NaT
+    group_assigned = defaultdict(int)  # כמה שובצו לכל קבוצה עד עכשיו
 
     # Split pools by group for fairness (optional)
     if respect_groups and "group" in interns.columns:
@@ -149,14 +173,25 @@ def build_schedule():
                             continue
 
                     # candidate score: fewer assigned first, then longest rest, then name tie-breaker
-                    rest_days = 999 if last is None else (day - last).days
-                    name_for_sort = r.get("last_name", r.get("first_name", ""))
-                    candidates.append((r.assigned, -rest_days, str(name_for_sort), email))
+    rest_days = 999 if last is None else (day - last).days
+    name_for_sort = r.get("last_name", r.get("first_name", ""))
+
+    # NEW: group deficit according to quotas
+    gname = r["group"] if "group" in r and pd.notna(r["group"]) else None
+    if gname and gname in group_targets:
+        deficit = group_targets[gname] - group_assigned[gname]
+    else:
+        deficit = 0
+
+    # add candidate tuple (note: now 5 fields, email is at index 4)
+    candidates.append((-deficit, r.assigned, -rest_days, str(name_for_sort), email))
 
                 if candidates:
                     candidates.sort()  # lowest assigned, then longest rest (since negative), then alpha
-                    chosen_email = candidates[0][3]
+                    chosen_email = candidates[0][4]
                     chosen = chosen_email
+                    if gname:
+    group_assigned[gname] += 1
 
                     # mutate global interns & pools
                     interns.loc[interns.email == chosen_email, "assigned"] += 1
