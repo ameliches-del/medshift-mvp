@@ -67,6 +67,16 @@ B,12
     if not group_quota_df.empty:
         st.dataframe(group_quota_df, use_container_width=True)
 
+# Holidays (optional)
+with st.sidebar.expander("📅 Holidays (optional)", expanded=False):
+    st.markdown("Upload CSV with column: **date** (YYYY-MM-DD)")
+    hol_file = st.file_uploader("Holidays CSV", type=["csv"], key="holidays")
+    if hol_file:
+        holidays_df = pd.read_csv(hol_file, parse_dates=["date"])
+    else:
+        holidays_df = pd.DataFrame(columns=["date"])
+
+# Map quotas for quick use
 group_targets = {}
 if 'group_quota_df' in locals() and not group_quota_df.empty:
     for _, r in group_quota_df.iterrows():
@@ -128,8 +138,19 @@ def build_schedule():
         group_cycle.rotate(-1)
         return g, groups[g]
 
+    # Helper: which group is currently most under target?
+    def leading_group():
+        if not group_targets:
+            return None
+        deficits = {g: group_targets[g] - group_assigned[g] for g in group_targets}
+        return max(deficits, key=lambda g: deficits[g])  # largest deficit
+
+    PREF_WED_FRI = {2, 4}  # Wed=2, Fri=4 (Mon=0)
+
     for day in calendar_days:
         year, week_idx, _ = day.isocalendar()
+        lead = leading_group()
+
         for slot in range(max_shifts_per_day):
             tried_groups = 0
             chosen = None
@@ -145,35 +166,61 @@ def build_schedule():
                     last = last_day_map[email]
                     if last is not None and (day - last).days < min_days_between_shifts:
                         continue
-                    if lock_weekends and day.weekday() >= 5:
+                    if lock_weekends and day.weekday() >= 5:  # Sat/Sun
                         prev_week_pick = weekend_last[(year, week_idx)]
                         if prev_week_pick == email:
                             continue
+
                     rest_days = 999 if last is None else (day - last).days
                     name_for_sort = r.get("last_name", r.get("first_name", ""))
+
+                    # Group deficit preference
                     gname = r["group"] if "group" in r and pd.notna(r["group"]) else None
                     if gname and gname in group_targets:
                         deficit = group_targets[gname] - group_assigned[gname]
                     else:
                         deficit = 0
-                    candidates.append((-deficit, r.assigned, -rest_days, str(name_for_sort), email))
+
+                    # Bonus for Wed/Fri if this candidate is from the leading group
+                    pref_bonus = 0.0
+                    if lead and gname == lead and day.weekday() in PREF_WED_FRI:
+                        pref_bonus = 0.5
+
+                    # Sorting tuple: higher (deficit+bonus) first → we store negative for ascending sort
+                    candidates.append((-(deficit + pref_bonus), r.assigned, -rest_days, str(name_for_sort), email))
+
                 if candidates:
                     candidates.sort()
                     chosen_email = candidates[0][4]
                     chosen = chosen_email
-                    if gname:
-                        group_assigned[gname] += 1
+
+                    # Fetch chosen intern's group for counters
+                    chosen_group = None
+                    try:
+                        chosen_row = interns.loc[interns.email == chosen_email].iloc[0]
+                        if "group" in chosen_row.index and pd.notna(chosen_row["group"]):
+                            chosen_group = chosen_row["group"]
+                    except Exception:
+                        pass
+
+                    if chosen_group:
+                        group_assigned[chosen_group] += 1
+
+                    # mutate global interns & pools
                     interns.loc[interns.email == chosen_email, "assigned"] += 1
                     interns.loc[interns.email == chosen_email, "last_day"] = pd.to_datetime(day)
                     if "group" in interns.columns and respect_groups:
                         groups[g_name].loc[groups[g_name].email == chosen_email, "assigned"] += 1
                         groups[g_name].loc[groups[g_name].email == chosen_email, "last_day"] = pd.to_datetime(day)
+
                     last_day_map[chosen_email] = day
                     if day.weekday() >= 5:
                         weekend_last[(year, week_idx)] = chosen_email
+
                     assignments.append({"date": day, "slot": slot + 1, "email": chosen_email})
                 else:
                     tried_groups += 1
+
             if chosen is None:
                 assignments.append({"date": day, "slot": slot + 1, "email": None})
 
@@ -190,10 +237,12 @@ def validate_schedule(df, min_rest_days=3, max_per_day=1):
     issues = []
     if df.empty:
         return issues
+    # max per day
     day_counts = df.groupby("date").size()
     for day, cnt in day_counts.items():
         if cnt > max_per_day:
             issues.append(f"More than {max_per_day} assignment on {day}.")
+    # rest rule
     df2 = df.dropna(subset=["email"]).copy()
     df2["date"] = pd.to_datetime(df2["date"]).dt.date
     by_email = df2.groupby("email")["date"].apply(lambda s: sorted(set(s)))
@@ -205,14 +254,14 @@ def validate_schedule(df, min_rest_days=3, max_per_day=1):
                     issues.append(f"Rest rule violated for {email}: {d} -> {dates[j]} (gap {gap}d)")
     return issues
 
-WEEKEND_DAYS = {4,5}  # Fri,Sat
+WEEKEND_DAYS = {4,5}  # Fri, Sat (IL)
 def weekend_issues(df):
     issues = []
     if df.empty:
         return issues
     df2 = df.dropna(subset=["email"]).copy()
     df2["date"] = pd.to_datetime(df2["date"]).dt.date
-    df2["weekday"] = pd.to_datetime(df2["date"]).dt.weekday
+    df2["weekday"] = pd.to_datetime(df2["date"]).dt.weekday  # Mon=0 ... Sun=6
     df2["iso_year_week"] = pd.to_datetime(df2["date"]).dt.isocalendar().year.astype(str) + "-" + \
                            pd.to_datetime(df2["date"]).dt.isocalendar().week.astype(str)
     for (email, yw), g in df2.groupby(["email","iso_year_week"]):
@@ -220,6 +269,22 @@ def weekend_issues(df):
         if len(wk) >= 2:
             days_str = ", ".join(sorted(str(d) for d in wk["date"].unique()))
             issues.append(f"Weekend repeat for {email} in week {yw}: {days_str}")
+    return issues
+
+def must_have_weekend_or_holiday(df, holidays_df):
+    issues = []
+    if df.empty:
+        return issues
+    hol_set = set(pd.to_datetime(holidays_df["date"]).dt.date) if not holidays_df.empty else set()
+    df2 = df.dropna(subset=["email"]).copy()
+    df2["date"] = pd.to_datetime(df2["date"]).dt.date
+    df2["weekday"] = pd.to_datetime(df2["date"]).dt.weekday
+    by_email = df2.groupby("email")
+    for email, g in by_email:
+        did_weekend = any(w in WEEKEND_DAYS for w in g["weekday"])
+        did_holiday = any(d in hol_set for d in g["date"])
+        if not (did_weekend or did_holiday):
+            issues.append(f"{email} has no weekend or holiday duty in this window")
     return issues
 
 # -----------------------------
@@ -236,35 +301,15 @@ schedule_df = st.session_state.get("schedule_df", pd.DataFrame())
 if not schedule_df.empty:
     problems = validate_schedule(schedule_df, min_rest_days=3, max_per_day=1)
     problems += weekend_issues(schedule_df)
+    problems += must_have_weekend_or_holiday(schedule_df, holidays_df)
     if problems:
         st.error("Validation issues found:")
         for p in problems:
             st.write("• " + p)
     else:
-        st.success("Validation passed: one duty/day, 3-day rest, and weekend respected.")
+        st.success("Validation passed: one duty/day, 3-day rest, weekend respected, and everyone has weekend/holiday.")
 
-    st.subheader("📅 Calendar view")
-    pivot = schedule_df.copy()
-    pivot["assignee"] = pivot.apply(
-        lambda r: f"{r['first_name']} {r['last_name']}".strip() if pd.notna(r.get("email")) else "—",
-        axis=1,
-    )
-    calendar = pivot.pivot_table(index="date", columns="slot", values="assignee", aggfunc=lambda x: " / ".join([str(i) for i in x]))
-    calendar.columns = [f"Slot {i}" for i in calendar.columns]
-    st.dataframe(calendar, use_container_width=True)
-
-    st.subheader("📋 Flat table")
-    st.dataframe(schedule_df, use_container_width=True)
-
-    st.subheader("📈 Load per intern")
-    counts = (
-        schedule_df.dropna(subset=["email"])
-        .groupby(["email","first_name","last_name"])
-        .size()
-        .reset_index(name="shifts")
-    )
-    st.dataframe(counts.sort_values("shifts", ascending=False), use_container_width=True)
-
+    # 🎯 Group quota check (target vs actual)
     if group_targets:
         st.subheader("🎯 Group quota check")
         actual_by_group = (
@@ -279,6 +324,34 @@ if not schedule_df.empty:
         compare["delta"] = compare["actual"] - compare["target"]
         st.dataframe(compare, use_container_width=True)
 
+    # Calendar view
+    st.subheader("📅 Calendar view")
+    pivot = schedule_df.copy()
+    pivot["assignee"] = pivot.apply(
+        lambda r: f"{r['first_name']} {r['last_name']}".strip() if pd.notna(r.get("email")) else "—",
+        axis=1,
+    )
+    calendar = pivot.pivot_table(index="date", columns="slot", values="assignee",
+                                 aggfunc=lambda x: " / ".join([str(i) for i in x]))
+    calendar.columns = [f"Slot {i}" for i in calendar.columns]
+    st.dataframe(calendar, use_container_width=True)
+
+    # Flat table
+    st.subheader("📋 Flat table")
+    st.dataframe(schedule_df, use_container_width=True)
+
+    # Load per intern
+    st.subheader("📈 Load per intern")
+    counts = (
+        schedule_df.dropna(subset=["email"])
+        .groupby(["email","first_name","last_name"])
+        .size()
+        .reset_index(name="shifts")
+    )
+    st.dataframe(counts.sort_values("shifts", ascending=False), use_container_width=True)
+
+    # Export
     csv_buf = io.StringIO()
     schedule_df.to_csv(csv_buf, index=False)
-    st.download_button("⬇️ Download CSV", data=csv_buf.getvalue(), file_name=f"medshift_schedule_{start_date}_{end_date}.csv", mime="text/csv")
+    st.download_button("⬇️ Download CSV", data=csv_buf.getvalue(),
+                       file_name=f"medshift_schedule_{start_date}_{end_date}.csv", mime="text/csv")
