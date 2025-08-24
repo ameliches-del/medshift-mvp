@@ -56,8 +56,9 @@ noa@example.com,2025-09-10
 with st.sidebar.expander("🏷️ Group quotas (optional)", expanded=False):
     st.markdown("Upload CSV with columns: **group,target_shifts**")
     default_group_csv = """group,target_shifts
-A,16
-B,12
+אחרי שלב א,2
+לפני שלב א,3
+חדשים,4
 """
     group_file = st.file_uploader("Group quotas CSV", type=["csv"], key="group_quotas")
     if group_file:
@@ -101,6 +102,7 @@ def daterange(start, end):
         yield start + timedelta(n)
 
 calendar_days = [d for d in daterange(start_date, end_date)]
+total_slots = len(calendar_days) * max_shifts_per_day
 
 if "max_shifts" not in interns_df.columns:
     interns_df["max_shifts"] = 9999
@@ -128,6 +130,12 @@ def build_schedule():
         groups = {"all": interns}
         group_cycle = deque(["all"])
 
+    # group priority: higher target_shifts ==> higher priority
+    group_order = []
+    if group_targets:
+        group_order = sorted(group_targets.keys(), key=lambda g: group_targets[g], reverse=True)
+    group_rank = {g: i for i, g in enumerate(group_order)}  # 0 is highest priority
+
     assignments = []
     last_day_map = {row.email: None for _, row in interns.iterrows()}
     weekend_last = defaultdict(lambda: None)
@@ -146,6 +154,10 @@ def build_schedule():
         return max(deficits, key=lambda g: deficits[g])  # largest deficit
 
     PREF_WED_FRI = {2, 4}  # Wed=2, Fri=4 (Mon=0)
+    sum_targets = sum(group_targets.values()) if group_targets else 0
+
+    def all_targets_met():
+        return group_targets and sum(group_assigned[g] for g in group_targets) >= sum_targets
 
     for day in calendar_days:
         year, week_idx, _ = day.isocalendar()
@@ -174,27 +186,35 @@ def build_schedule():
                     rest_days = 999 if last is None else (day - last).days
                     name_for_sort = r.get("last_name", r.get("first_name", ""))
 
-                    # Group deficit preference
                     gname = r["group"] if "group" in r and pd.notna(r["group"]) else None
+
+                    # ---- scoring logic ----
+                    # Phase 1: push to hit targets (positive deficit => higher priority)
+                    deficit = 0
                     if gname and gname in group_targets:
-                        deficit = group_targets[gname] - group_assigned[gname]
-                    else:
-                        deficit = 0
+                        deficit = max(0, group_targets[gname] - group_assigned[gname])
 
-                    # Bonus for Wed/Fri if this candidate is from the leading group
-                    pref_bonus = 0.0
-                    if lead and gname == lead and day.weekday() in PREF_WED_FRI:
-                        pref_bonus = 0.5
+                    # Phase 2: overflow (when all targets met) — allocate extras by group rank (priority)
+                    overflow_bonus = 0.0
+                    if all_targets_met() and gname in group_rank:
+                        # high fixed bonus for higher priority groups so they soak up extras first
+                        overflow_bonus = 100.0 - group_rank[gname]  # 100, 99, 98, ...
 
-                    # Sorting tuple: higher (deficit+bonus) first → we store negative for ascending sort
-                    candidates.append((-(deficit + pref_bonus), r.assigned, -rest_days, str(name_for_sort), email))
+                    # Extra: Bonus for Wed/Fri if candidate is from current leading group (still under target)
+                    wed_fri_bonus = 0.0
+                    if lead and gname == lead and (group_targets[gname] - group_assigned[gname]) > 0 and day.weekday() in PREF_WED_FRI:
+                        wed_fri_bonus = 0.5
+
+                    score_primary = deficit + overflow_bonus + wed_fri_bonus
+                    # store negative for ascending sort (higher score preferred)
+                    candidates.append((-score_primary, r.assigned, -rest_days, str(name_for_sort), email))
 
                 if candidates:
                     candidates.sort()
                     chosen_email = candidates[0][4]
                     chosen = chosen_email
 
-                    # Fetch chosen intern's group for counters
+                    # find chosen group to update counters
                     chosen_group = None
                     try:
                         chosen_row = interns.loc[interns.email == chosen_email].iloc[0]
@@ -206,7 +226,6 @@ def build_schedule():
                     if chosen_group:
                         group_assigned[chosen_group] += 1
 
-                    # mutate global interns & pools
                     interns.loc[interns.email == chosen_email, "assigned"] += 1
                     interns.loc[interns.email == chosen_email, "last_day"] = pd.to_datetime(day)
                     if "group" in interns.columns and respect_groups:
